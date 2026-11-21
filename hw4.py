@@ -34,53 +34,149 @@ load_dotenv()
 # =============================================================================
 
 
-def table_to_text(table_html: str) -> str:
-    """Task 1.1: turn one HTML <table> into text that keeps every value with its row and its column.
+from functools import lru_cache
+from collections import defaultdict
 
-    Put each value on a line (at most 400 characters) together with its row label and its column
-    header, e.g. "Revenue | 2025: 2,710.4 | 2024: 2,629.1", one table row per line, keep the text of
-    every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
-    LLM here.
-    """
-    ### YOUR CODE HERE
-    return ""
+from bs4 import BeautifulSoup
+from rank_bm25 import BM25Okapi
+
+# Company identities come only from document mastheads.
+_companies = {}
+
+
+def table_to_text(table_html: str) -> str:
+    table = BeautifulSoup(table_html, "lxml").find("table")
+    rows = table.find_all("tr")
+    headers = [cell.get_text(" ", strip=True) for cell in rows[0].find_all(["th", "td"])]
+    lines = [table.caption.get_text(" ", strip=True)] if table.caption else []
+    for row in rows[1:]:
+        cells = [cell.get_text(" ", strip=True) for cell in row.find_all(["td", "th"])]
+        if cells:
+            pairs = [f"{header}: {value}" for header, value in zip(headers[1:], cells[1:])]
+            line = " | ".join([cells[0], *pairs])
+            lines.extend([line] if len(line) <= 400 else [f"{cells[0]} | {pair}" for pair in pairs])
+    return "\n".join(lines)
+
+
+def metadata(file_name, soup):
+    company = soup.h1.get_text(" ", strip=True).split("(")[0].strip()
+    title = soup.title.get_text(" ", strip=True) if soup.title else soup.body.get_text(" ", strip=True)[:400]
+    kind = "annual_report" if "annual report" in title.lower() else (
+        "earnings_call" if "call" in title.lower() else "research_report")
+    year = int(re.search(r"(?:19|20)\d{2}", title).group())
+    _companies[company_key(company)] = company
+    return dict(source=file_name, company=company, fiscal_year=year, doc_type=kind)
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
-    """Task 1.2: split one document into chunks of at most MAX_CHUNK_CHARS characters.
+    soup = BeautifulSoup(html, "lxml")
+    meta = metadata(file_name, soup)
+    chunks = []
+    section = soup.h1.get_text(" ", strip=True)
+    for node in soup.body.find_all(["h2", "h3", "p", "li", "table", "h1"]):
+        if node.find_parent(["table", "p", "li"]):
+            continue
+        if node.name in ("h2", "h3"):
+            section = node.get_text(" ", strip=True)
+        text = table_to_text(str(node)) if node.name == "table" else node.get_text(" ", strip=True)
+        header = section[:150] + "\n"
+        room = MAX_CHUNK_CHARS - len(header)
+        while text:
+            stop = len(text)
+            if stop > room:
+                stop = text.rfind("\n", 0, room + 1)
+                if stop <= 0:
+                    stop = text.rfind(" ", 0, room + 1)
+                if stop <= 0:
+                    stop = room
+            chunks.append(Document(page_content=header + text[:stop], metadata=meta))
+            text = text[stop:].strip()
+    return chunks
 
-    Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
-    "doc_type" (one of DOC_TYPES). Do not call the LLM here.
-    """
-    ### YOUR CODE HERE
-    return []
+
+@lru_cache(maxsize=512)
+def unfamiliar_companies(question):
+    msg = make_llm(max_tokens=100).invoke(
+        "Extract companies that the following equity research question asks ABOUT, including unfamiliar "
+        "companies. Exclude brokers, auditors, geographic regions and segments. Preserve full names. "
+        "Output only a JSON array of strings.\nQuestion: " + question)
+    match = re.search(r"\[.*?\]", str(msg.content), re.S)
+    return json.loads(match.group()) if match else []
 
 
 def parse_query(question: str) -> dict:
-    """Task 2.2: {"companies": [names], "fiscal_year": int or None, "doc_type": one of DOC_TYPES}.
+    q = normalize(question)
+    names = [name for key, name in _companies.items() if " " + key + " " in q]
+    # Also resolve a missing side of a comparison, or a longer unknown name with a known prefix.
+    extended = any(re.search(r"(?i:\b" + re.escape(key) + r")\s+(?!(?i:inc|ltd|corp|plc)\b)[A-Z][a-z]+",
+                             question) for key in _companies if " " + key + " " in q)
+    if not names or extended or (len(names) == 1 and re.search(r"\bor\b", q)):
+        names = unfamiliar_companies(question)
+    years = re.findall(r"(?:19|20)\d{2}", question)
+    if re.search(r"earnings call|conference call|management guid", question, re.I):
+        kind = "earnings_call"
+    elif re.search(r"broker|\bratings?\b|target price|forecast|results review|analyst.{0,12}estimat", question, re.I):
+        kind = "research_report"
+    else:
+        kind = "annual_report"
+    return dict(companies=names, fiscal_year=int(years[-1]) if years else None, doc_type=kind)
 
-    The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
-    """
-    ### YOUR CODE HERE
-    return {}
+
+def tokens(text):
+    words = re.findall(r"[a-z]+|\d+", text.lower())
+    stems = {"headquartered": "headquarters", "headcount": "employees", "borrowing": "borrowings",
+             "audited": "auditor", "auditing": "auditor", "estimate": "forecast"}
+    return [stems.get(w, w) for w in words]
 
 
 def build_index(chunks: list[Document]) -> Any:
-    """Task 2: index the chunks of the whole corpus (the output of chunk_document), once per run.
+    groups = defaultdict(list)
+    for i, c in enumerate(chunks):
+        m = c.metadata
+        groups[company_key(m["company"]), m["doc_type"]].append(i)
+    return chunks, BM25Okapi([tokens(c.page_content) for c in chunks]), groups
 
-    Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
-    """
-    ### YOUR CODE HERE
-    return None
+
+def ranked(index, question, parsed):
+    chunks, model, groups = index
+    query = question
+    for name in parsed["companies"]:
+        query = re.sub(re.escape(company_key(name)), " ", query, flags=re.I)
+    words = [w for w in tokens(query) if not w.isdigit() and w not in
+             "what were was is who which in on at the a of how much more higher for did does s usd millions december fy company or".split()]
+    scores = model.get_scores(words)
+    table_bonus = 3 if re.search(r"million|employees|income|assets|cash", query, re.I) else 0
+    return scoped_top(chunks, groups, parsed, lambda i: scores[i] + (table_bonus if " | " in chunks[i].page_content else 0))
+
+
+def scoped_top(chunks, groups, parsed, score):
+    kind, year = parsed["doc_type"], parsed["fiscal_year"]
+    lists = []
+    for name in parsed["companies"]:
+        ids = groups.get((company_key(name), kind), [])
+        if not ids:
+            return []
+        if year and kind == "annual_report":
+            exact = [i for i in ids if chunks[i].metadata["fiscal_year"] == year]
+            ids = exact or [i for i in ids if chunks[i].metadata["fiscal_year"] == year + 1]
+        if not ids:
+            return []
+        lists.append(sorted(ids, key=score, reverse=True)[:MAX_RETRIEVED])
+    return [chunks[row[depth]] for depth in range(MAX_RETRIEVED) for row in lists
+            if depth < len(row)][:MAX_RETRIEVED]
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
-    """Tasks 2 and 3: at most MAX_RETRIEVED of the chunks given to build_index, best first.
-
-    Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
-    """
-    ### YOUR CODE HERE
-    return []
+    selected = ranked(index, question, parse_query(question))
+    if selected:
+        verdict = make_llm(max_tokens=12).invoke(
+            "Does this evidence disclose every fact needed for the question, for the exact entity, "
+            "period and metric? Prior-year columns and explicitly labeled forecasts count. "
+            "A related metric is insufficient. Respond YES or NO only.\nQuestion: " + question +
+            "\nEvidence:\n" + format_context(selected))
+        if str(verdict.content).strip().upper().startswith("NO"):
+            return []
+    return selected
 
 
 # =============================================================================
